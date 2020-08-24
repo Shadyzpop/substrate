@@ -36,6 +36,7 @@ const API_BENCHMARK_BATCHES: u32 = 20;
 /// has an easier time determining the contribution of that component.
 const API_BENCHMARK_BATCH_SIZE: u32 = 100;
 
+#[derive(Clone)]
 struct WasmModule<T:Trait> {
 	code: Vec<u8>,
 	hash: <T::Hashing as Hash>::Output,
@@ -268,7 +269,8 @@ enum Endow {
 	CollectRent,
 }
 
-fn instantiate_contract<T: Trait>(
+fn instantiate_contract_from_index<T: Trait>(
+	account_index: u32,
 	module: WasmModule<T>,
 	data: Vec<u8>,
 	endowment: Endow,
@@ -293,7 +295,7 @@ fn instantiate_contract<T: Trait>(
 		Endow::Max => (0.into(), funding::<T>().saturating_sub(T::Currency::minimum_balance()))
 	};
 
-	let caller = create_funded_user::<T>("instantiator", 0);
+	let caller = create_funded_user::<T>("instantiator", account_index);
 	let addr = T::DetermineContractAddress::contract_address_for(&module.hash, &data, &caller);
 	init_block_number::<T>();
 	Contracts::<T>::put_code_raw(module.code)?;
@@ -313,6 +315,14 @@ fn instantiate_contract<T: Trait>(
 		addr: T::Lookup::unlookup(addr),
 		endowment,
 	})
+}
+
+fn instantiate_contract<T: Trait>(
+	module: WasmModule<T>,
+	data: Vec<u8>,
+	endowment: Endow,
+) -> Result<Contract<T>, &'static str> {
+	instantiate_contract_from_index(0, module, data, endowment)
 }
 
 fn get_alive<T: Trait>(addr: &T::AccountId) -> Result<AliveContractInfo<T>, &'static str> {
@@ -1000,12 +1010,70 @@ benchmarks! {
 		for account in &accounts {
 			assert_eq!(T::Currency::total_balance(account), 0.into());
 		}
-		}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
+	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 	verify {
 		for account in &accounts {
 			assert_eq!(T::Currency::total_balance(account), value);
 		}
 	}
+
+	seal_call {
+		let r in 0 .. API_BENCHMARK_BATCHES;
+		let dummy_code = dummy_code::<T>();
+		let callees = (0..r * API_BENCHMARK_BATCH_SIZE)
+			.map(|i| instantiate_contract_from_index(i + 1, dummy_code.clone(), vec![], Endow::Max))
+			.collect::<Result<Vec<_>, _>>()?;
+		let callee_len = callees.get(0).map(|i| i.account_id.encode().len()).unwrap_or(0);
+		let callee_bytes = callees.iter().flat_map(|x| x.account_id.encode()).collect();
+		let value: BalanceOf<T> = 0.into();
+		let value_bytes = value.encode();
+		let value_len = value_bytes.len();
+		use CountedInstruction::{Counter, Regular};
+		let code = create_code::<T>(ModuleDefinition {
+			memory: Some(ImportedMemory::max::<T>()),
+			imported_functions: vec![ImportedFunction {
+				name: "seal_call",
+				params: vec![
+					ValueType::I32,
+					ValueType::I32,
+					ValueType::I64,
+					ValueType::I32,
+					ValueType::I32,
+					ValueType::I32,
+					ValueType::I32,
+					ValueType::I32,
+					ValueType::I32,
+				],
+				return_type: Some(ValueType::I32),
+			}],
+			data_segments: vec![
+				DataSegment {
+					offset: 0,
+					value: value_bytes,
+				},
+				DataSegment {
+					offset: value_len as u32,
+					value: callee_bytes,
+				},
+			],
+			call_body: Some(body_counted(r * API_BENCHMARK_BATCH_SIZE, vec![
+				Counter(value_len as u32, callee_len as u32), // callee_ptr
+				Regular(Instruction::I32Const(callee_len as i32)), // callee_len
+				Regular(Instruction::I64Const(0)), // gas
+				Regular(Instruction::I32Const(0)), // value_ptr
+				Regular(Instruction::I32Const(value_len as i32)), // value_len
+				Regular(Instruction::I32Const(0)), // input_data_ptr
+				Regular(Instruction::I32Const(0)), // input_data_len
+				Regular(Instruction::I32Const(u32::max_value() as i32)), // output_ptr
+				Regular(Instruction::I32Const(0)), // output_len_ptr
+				Regular(Instruction::Call(0)),
+				Regular(Instruction::Drop),
+			])),
+			.. Default::default()
+		});
+		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
+		let origin = RawOrigin::Signed(instance.caller.clone());
+	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
 	// Only the overhead of calling the function itself with minimal arguments.
 	seal_hash_sha2_256 {
@@ -1127,6 +1195,7 @@ mod tests {
 	create_test!(seal_get_storage);
 	create_test!(seal_get_storage_per_kb);
 	create_test!(seal_transfer);
+	create_test!(seal_call);
 	create_test!(seal_clear_storage);
 	create_test!(seal_hash_sha2_256);
 	create_test!(seal_hash_sha2_256_per_kb);

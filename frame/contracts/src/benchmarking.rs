@@ -263,22 +263,35 @@ fn hasher_code<T: Trait>(name: &'static str, repeat: u32, data_size: u32) -> Was
 	})
 }
 
+enum Endow {
+	Max,
+	CollectRent,
+}
+
 fn instantiate_contract<T: Trait>(
 	module: WasmModule<T>,
 	data: Vec<u8>,
+	endowment: Endow,
 ) -> Result<Contract<T>, &'static str>
 {
-	// storage_size cannot be zero because otherwise a contract that is just above the subsistence
-	// threshold does not pay rent given a large enough subsistence threshold. But we need rent
-	// payments to occur in order to benchmark for worst cases.
-	let storage_size = Config::<T>::subsistence_threshold_uncached()
-		.checked_div(&T::RentDepositOffset::get())
-		.unwrap_or_else(Zero::zero);
+	let (storage_size, endowment) = match endowment {
+		Endow::CollectRent => {
+			// storage_size cannot be zero because otherwise a contract that is just above
+			// the subsistence threshold does not pay rent given a large enough subsistence
+			// threshold. But we need rent payments to occur in order to benchmark for worst cases.
+			let storage_size = Config::<T>::subsistence_threshold_uncached()
+				.checked_div(&T::RentDepositOffset::get())
+				.unwrap_or_else(Zero::zero);
 
-	// Endowment should be large but not as large to inhibit rent payments.
-	let endowment = T::RentDepositOffset::get()
-		.saturating_mul(storage_size + T::StorageSizeOffset::get().into())
-		.saturating_sub(1.into());
+			// Endowment should be large but not as large to inhibit rent payments.
+			let endowment = T::RentDepositOffset::get()
+				.saturating_mul(storage_size + T::StorageSizeOffset::get().into())
+				.saturating_sub(1.into());
+
+			(storage_size, endowment)
+		},
+		Endow::Max => (0.into(), funding::<T>().saturating_sub(T::Currency::minimum_balance()))
+	};
 
 	let caller = create_funded_user::<T>("instantiator", 0);
 	let addr = T::DetermineContractAddress::contract_address_for(&module.hash, &data, &caller);
@@ -405,7 +418,7 @@ benchmarks! {
 	call {
 		let n in 0 .. u16::max_value() as u32;
 		let data = vec![0u8; n as usize];
-		let instance = instantiate_contract::<T>(dummy_code(), vec![])?;
+		let instance = instantiate_contract::<T>(dummy_code(), vec![], Endow::CollectRent)?;
 		let value = T::Currency::minimum_balance() * 100.into();
 		let origin = RawOrigin::Signed(instance.caller.clone());
 
@@ -431,7 +444,7 @@ benchmarks! {
 	// no incentive to remove large contracts when the removal is more expensive than
 	// the reward for removing them.
 	claim_surcharge {
-		let instance = instantiate_contract::<T>(dummy_code(), vec![])?;
+		let instance = instantiate_contract::<T>(dummy_code(), vec![], Endow::CollectRent)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 		let account_id = instance.account_id.clone();
 
@@ -456,7 +469,7 @@ benchmarks! {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = instantiate_contract::<T>(getter_code(
 			"seal_caller", r * API_BENCHMARK_BATCH_SIZE
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -464,7 +477,7 @@ benchmarks! {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = instantiate_contract::<T>(getter_code(
 			"seal_address", r * API_BENCHMARK_BATCH_SIZE
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -472,7 +485,7 @@ benchmarks! {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = instantiate_contract::<T>(getter_code(
 			"seal_gas_left", r * API_BENCHMARK_BATCH_SIZE
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -480,7 +493,7 @@ benchmarks! {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = instantiate_contract::<T>(getter_code(
 			"seal_balance", r * API_BENCHMARK_BATCH_SIZE
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -488,7 +501,7 @@ benchmarks! {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = instantiate_contract::<T>(getter_code(
 			"seal_value_transferred", r * API_BENCHMARK_BATCH_SIZE
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -496,7 +509,7 @@ benchmarks! {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = instantiate_contract::<T>(getter_code(
 			"seal_minimum_balance", r * API_BENCHMARK_BATCH_SIZE
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -504,7 +517,7 @@ benchmarks! {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = instantiate_contract::<T>(getter_code(
 			"seal_tombstone_deposit", r * API_BENCHMARK_BATCH_SIZE
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -512,7 +525,7 @@ benchmarks! {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = instantiate_contract::<T>(getter_code(
 			"seal_rent_allowance", r * API_BENCHMARK_BATCH_SIZE
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -520,7 +533,7 @@ benchmarks! {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = instantiate_contract::<T>(getter_code(
 			"seal_block_number", r * API_BENCHMARK_BATCH_SIZE
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -546,7 +559,7 @@ benchmarks! {
 			])),
 			.. Default::default()
 		});
-		let instance = instantiate_contract::<T>(code, vec![])?;
+		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -564,7 +577,7 @@ benchmarks! {
 			])),
 			.. Default::default()
 		});
-		let instance = instantiate_contract::<T>(code, vec![])?;
+		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
@@ -594,7 +607,7 @@ benchmarks! {
 			])),
 			.. Default::default()
 		});
-		let instance = instantiate_contract::<T>(code, vec![])?;
+		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
 		let data = vec![42u8; (n * 1024).min(buffer_size) as usize];
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), data)
@@ -618,7 +631,7 @@ benchmarks! {
 			])),
 			.. Default::default()
 		});
-		let instance = instantiate_contract::<T>(code, vec![])?;
+		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -652,7 +665,7 @@ benchmarks! {
 			])),
 			.. Default::default()
 		});
-		let instance = instantiate_contract::<T>(code, vec![])?;
+		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -676,7 +689,7 @@ benchmarks! {
 			])),
 			.. Default::default()
 		});
-		let instance = instantiate_contract::<T>(code, vec![])?;
+		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -714,7 +727,7 @@ benchmarks! {
 			])),
 			.. Default::default()
 		});
-		let instance = instantiate_contract::<T>(code, vec![])?;
+		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -742,7 +755,7 @@ benchmarks! {
 			])),
 			.. Default::default()
 		});
-		let instance = instantiate_contract::<T>(code, vec![])?;
+		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -778,7 +791,7 @@ benchmarks! {
 			])),
 			.. Default::default()
 		});
-		let instance = instantiate_contract::<T>(code, vec![])?;
+		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -807,7 +820,7 @@ benchmarks! {
 			])),
 			.. Default::default()
 		});
-		let instance = instantiate_contract::<T>(code, vec![])?;
+		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -841,7 +854,7 @@ benchmarks! {
 			])),
 			.. Default::default()
 		});
-		let instance = instantiate_contract::<T>(code, vec![])?;
+		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
 		let trie_id = get_alive::<T>(&instance.account_id)?.trie_id;
 		for key in keys {
 			crate::storage::write_contract_storage::<T>(
@@ -886,7 +899,7 @@ benchmarks! {
 			])),
 			.. Default::default()
 		});
-		let instance = instantiate_contract::<T>(code, vec![])?;
+		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
 		let trie_id = get_alive::<T>(&instance.account_id)?.trie_id;
 		for key in keys {
 			crate::storage::write_contract_storage::<T>(
@@ -932,7 +945,7 @@ benchmarks! {
 			])),
 			.. Default::default()
 		});
-		let instance = instantiate_contract::<T>(code, vec![])?;
+		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
 		let trie_id = get_alive::<T>(&instance.account_id)?.trie_id;
 		crate::storage::write_contract_storage::<T>(
 			&instance.account_id,
@@ -982,7 +995,7 @@ benchmarks! {
 			])),
 			.. Default::default()
 		});
-		let instance = instantiate_contract::<T>(code, vec![])?;
+		let instance = instantiate_contract::<T>(code, vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 		for account in &accounts {
 			assert_eq!(T::Currency::total_balance(account), 0.into());
@@ -999,7 +1012,7 @@ benchmarks! {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = instantiate_contract::<T>(hasher_code(
 			"seal_hash_sha2_256", r * API_BENCHMARK_BATCH_SIZE, 0,
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -1008,7 +1021,7 @@ benchmarks! {
 		let n in 0 .. max_pages::<T>() * 64;
 		let instance = instantiate_contract::<T>(hasher_code(
 			"seal_hash_sha2_256", API_BENCHMARK_BATCH_SIZE, n * 1024,
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -1017,7 +1030,7 @@ benchmarks! {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = instantiate_contract::<T>(hasher_code(
 			"seal_hash_keccak_256", r * API_BENCHMARK_BATCH_SIZE, 0,
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -1026,7 +1039,7 @@ benchmarks! {
 		let n in 0 .. max_pages::<T>() * 64;
 		let instance = instantiate_contract::<T>(hasher_code(
 			"seal_hash_keccak_256", API_BENCHMARK_BATCH_SIZE, n * 1024,
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -1035,7 +1048,7 @@ benchmarks! {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = instantiate_contract::<T>(hasher_code(
 			"seal_hash_blake2_256", r * API_BENCHMARK_BATCH_SIZE, 0,
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -1044,7 +1057,7 @@ benchmarks! {
 		let n in 0 .. max_pages::<T>() * 64;
 		let instance = instantiate_contract::<T>(hasher_code(
 			"seal_hash_blake2_256", API_BENCHMARK_BATCH_SIZE, n * 1024,
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -1053,7 +1066,7 @@ benchmarks! {
 		let r in 0 .. API_BENCHMARK_BATCHES;
 		let instance = instantiate_contract::<T>(hasher_code(
 			"seal_hash_blake2_128", r * API_BENCHMARK_BATCH_SIZE, 0,
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 
@@ -1062,7 +1075,7 @@ benchmarks! {
 		let n in 0 .. max_pages::<T>() * 64;
 		let instance = instantiate_contract::<T>(hasher_code(
 			"seal_hash_blake2_128", API_BENCHMARK_BATCH_SIZE, n * 1024,
-		), vec![])?;
+		), vec![], Endow::Max)?;
 		let origin = RawOrigin::Signed(instance.caller.clone());
 	}: call(origin, instance.addr, 0.into(), Weight::max_value(), vec![])
 }

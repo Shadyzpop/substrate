@@ -256,6 +256,10 @@ pub struct Protocol<B: BlockT, H: ExHashT> {
 	metrics: Option<Metrics>,
 	/// The `PeerId`'s of all boot nodes.
 	boot_node_ids: Arc<HashSet<PeerId>>,
+	/// All the block announcement pre-validations that are currently active.
+	block_announce_pre_validation: FuturesUnordered<
+		Box<Future<Output = sync::PreValidateBlockAnnounce<B::Header>>
+	>,
 }
 
 #[derive(Default)]
@@ -466,6 +470,7 @@ impl<B: BlockT, H: ExHashT> Protocol<B, H> {
 				None
 			},
 			boot_node_ids,
+			block_announce_pre_validation: FuturesUnordered::new(),
 		};
 
 		Ok((protocol, peerset_handle))
@@ -554,7 +559,9 @@ impl<B: BlockT, H: ExHashT> Protocol<B, H> {
 	pub fn update_chain(&mut self) {
 		let info = self.context_data.chain.info();
 		self.sync.update_chain_info(&info.best_hash, info.best_number);
-		self.behaviour.set_legacy_handshake_message(build_status_message(&self.config, &self.context_data.chain));
+		self.behaviour.set_legacy_handshake_message(
+			build_status_message(&self.config, &self.context_data.chain),
+		);
 		self.behaviour.set_notif_protocol_handshake(
 			&self.block_announces_protocol,
 			BlockAnnouncesHandshake::build(&self.config, &self.context_data.chain).encode()
@@ -585,11 +592,16 @@ impl<B: BlockT, H: ExHashT> Protocol<B, H> {
 		who: PeerId,
 		data: BytesMut,
 	) -> CustomMessageOutcome<B> {
-
 		let message = match <Message<B> as Decode>::decode(&mut &data[..]) {
 			Ok(message) => message,
 			Err(err) => {
-				debug!(target: "sync", "Couldn't decode packet sent by {}: {:?}: {}", who, data, err.what());
+				debug!(
+					target: "sync",
+					"Couldn't decode packet sent by {}: {:?}: {}",
+					who,
+					data,
+					err.what(),
+				);
 				self.peerset_handle.report_peer(who, rep::BAD_MESSAGE);
 				return CustomMessageOutcome::None;
 			}
@@ -1300,11 +1312,11 @@ impl<B: BlockT, H: ExHashT> Protocol<B, H> {
 		}
 	}
 
-	fn on_block_announce(
+	fn pre_validate_block_announce(
 		&mut self,
 		who: PeerId,
 		announce: BlockAnnounce<B::Header>,
-	) -> CustomMessageOutcome<B> {
+	) {
 		let hash = announce.header.hash();
 		let number = *announce.header.number();
 
@@ -1317,7 +1329,15 @@ impl<B: BlockT, H: ExHashT> Protocol<B, H> {
 			message::BlockState::Normal => false,
 		};
 
-		match self.sync.on_block_announce(&who, hash, &announce, is_their_best) {
+		let future = self.sync.pre_validate_block_announce(who, &hash, announce, is_best);
+		self.block_announce_pre_validation.push(future);
+	}
+
+	fn on_block_announce(
+		&mut self,
+		pre_validation_result: sync::PreValidateBlockAnnounce<B::Header>,
+	) -> CustomMessageOutcome<B> {
+		match self.sync.on_block_announce(pre_validation_result) {
 			sync::OnBlockAnnounce::Nothing => {
 				// `on_block_announce` returns `OnBlockAnnounce::ImportHeader`
 				// when we have all data required to import the block

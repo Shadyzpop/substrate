@@ -50,6 +50,7 @@ use sp_runtime::{
 };
 use sp_arithmetic::traits::Saturating;
 use std::{fmt, ops::Range, collections::{HashMap, HashSet, VecDeque}, sync::Arc};
+use futures::future::{Either as FEither, Future, ready};
 
 mod blocks;
 mod extra_requests;
@@ -313,6 +314,23 @@ pub enum OnBlockAnnounce {
 	Nothing,
 	/// The announcement header should be imported.
 	ImportHeader,
+}
+
+/// Result of [`ChainSync::pre_validate_block_announce`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreValidateBlockAnnounce<H> {
+	/// The announcement does not require further handling.
+	Nothing,
+	/// The pre-validation was sucessful and the announcement should be
+	/// further processed.
+	Process {
+		/// Is this the new best block of the peer?
+		is_new_best: bool,
+		/// The id of the peer that send us the announcement.
+		who: PeerId,
+		/// The announcement.
+		announce: BlockAnnounce<H>,
+	},
 }
 
 /// Result of [`ChainSync::on_block_justification`].
@@ -1156,23 +1174,82 @@ impl<B: BlockT> ChainSync<B> {
 		self.pending_requests.set_all();
 	}
 
+	pub fn pre_validate_block_announce(
+		&self,
+		who: PeerId,
+		hash: &B::Hash,
+		announce: BlockAnnounce<B::Header>,
+		is_best: bool,
+	) -> FEither<impl Future<Output = PreValidateBlockAnnounce<B::Header>>, impl Future> {
+		let header = &announce.header;
+		let number = *header.number();
+		debug!(
+			target: "sync",
+			"Pre-validating received block announcement {:?} with number {:?} from {}",
+			hash,
+			number,
+			who,
+		);
+
+		if number.is_zero() {
+			warn!(
+				target: "sync",
+				"💔 Ignored genesis block (#0) announcement from {}: {}",
+				who,
+				hash,
+			);
+			return FEither::Left(ready(PreValidateBlockAnnounce::Nothing))
+		}
+
+		// Let external validator check the block announcement.
+		let assoc_data = announce.data.as_ref().map_or(&[][..], |v| v.as_slice());
+		FEither::Right(
+			self.block_announce_validator.validate(&header, assoc_data).map(|r|
+				match r {
+					Ok(Validation::Success { is_new_best }) =>
+						ready(PreValidateBlockAnnounce::Process {
+							is_new_best: is_new_best || is_best,
+							announce,
+							who,
+						}),
+					Ok(Validation::Failure) => {
+						debug!(
+							target: "sync",
+							"Block announcement validation of block {} from {} failed",
+							hash,
+							who,
+						);
+						ready(PreValidateBlockAnnounce::Nothing)
+					}
+					Err(e) => {
+						error!(target: "sync", "💔 Block announcement validation errored: {}", e);
+						ready(PreValidateBlockAnnounce::Nothing)
+					}
+				}
+			)
+		)
+	}
+
 	/// Call when a node announces a new block.
 	///
 	/// If `OnBlockAnnounce::ImportHeader` is returned, then the caller MUST try to import passed
 	/// header (call `on_block_data`). The network request isn't sent
 	/// in this case. Both hash and header is passed as an optimization
 	/// to avoid rehashing the header.
-	pub fn on_block_announce(&mut self, who: &PeerId, hash: B::Hash, announce: &BlockAnnounce<B::Header>, is_best: bool)
-		-> OnBlockAnnounce
-	{
+	pub fn on_block_announce(
+		&mut self,
+		pre_validation_result: PreValidateBlockAnnounce<B::Header>,
+	) -> OnBlockAnnounce {
+		let (announce, is_best, who) = match pre_validation_result {
+			PreValidateBlockAnnounce::Nothing => return OnBlockAnnounce::Nothing,
+			PreValidateBlockAnnounce::Process { announce, is_new_best, who } =>
+				(announce, is_new_best, who),
+		};
+
 		let header = &announce.header;
 		let number = *header.number();
-		debug!(target: "sync", "Received block announcement {:?} with number {:?} from {}", hash, number, who);
-		if number.is_zero() {
-			warn!(target: "sync", "💔 Ignored genesis block (#0) announcement from {}: {}", who, hash);
-			return OnBlockAnnounce::Nothing
-		}
-		let parent_status = self.block_status(header.parent_hash()).ok().unwrap_or(BlockStatus::Unknown);
+		let hash = header.hash();
+		let parent_status = self.block_status(header.parent_hash()).unwrap_or(BlockStatus::Unknown);
 		let known_parent = parent_status != BlockStatus::Unknown;
 		let ancient_parent = parent_status == BlockStatus::InChainPruned;
 
@@ -1183,33 +1260,22 @@ impl<B: BlockT> ChainSync<B> {
 			error!(target: "sync", "💔 Called on_block_announce with a bad peer ID");
 			return OnBlockAnnounce::Nothing
 		};
+
 		while peer.recently_announced.len() >= ANNOUNCE_HISTORY_SIZE {
 			peer.recently_announced.pop_front();
 		}
 		peer.recently_announced.push_back(hash.clone());
-
-		// Let external validator check the block announcement.
-		let assoc_data = announce.data.as_ref().map_or(&[][..], |v| v.as_slice());
-		let is_best = match self.block_announce_validator.validate(&header, assoc_data) {
-			Ok(Validation::Success { is_new_best }) => is_new_best || is_best,
-			Ok(Validation::Failure) => {
-				debug!(target: "sync", "Block announcement validation of block {} from {} failed", hash, who);
-				return OnBlockAnnounce::Nothing
-			}
-			Err(e) => {
-				error!(target: "sync", "💔 Block announcement validation errored: {}", e);
-				return OnBlockAnnounce::Nothing
-			}
-		};
 
 		if is_best {
 			// update their best block
 			peer.best_number = number;
 			peer.best_hash = hash;
 		}
+
 		if let PeerSyncState::AncestorSearch {..} = peer.state {
 			return OnBlockAnnounce::Nothing
 		}
+
 		// If the announced block is the best they have and is not ahead of us, our common number
 		// is either one further ahead or it's the one they just announced, if we know about it.
 		if is_best {
